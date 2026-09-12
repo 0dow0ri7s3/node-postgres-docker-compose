@@ -1,9 +1,9 @@
 # Node.js + Postgres with Docker Compose
 
 A two-container stack: a Node.js application and a Postgres database, wired together
-with Docker Compose. Service-name networking, healthcheck-gated startup, a named
-volume for persistence, and every environment-specific value passed in as
-configuration rather than written into the code.
+with Docker Compose. Service-name networking, a healthcheck that actually tests the
+database, a named volume for persistence, and every environment-specific value passed
+in as configuration rather than written into the code.
 
 Built from scratch as a working reference for containerised application deployment.
 
@@ -12,7 +12,7 @@ Built from scratch as a working reference for containerised application deployme
 ## The problem
 
 Running an application and its database in separate containers introduces three
-problems that a naive `docker-compose.yml` does not solve:
+problems a naive `docker-compose.yml` does not solve:
 
 **The application starts before the database is ready.** Containers start in seconds;
 Postgres takes longer to accept connections. The app connects, fails, and exits. This
@@ -26,7 +26,9 @@ moment the container is removed.
 written into the source, the same code cannot run in a different environment without
 being edited — which means maintaining two copies of it.
 
-This repository is a small stack that solves all three.
+This repository is a small stack that solves all three, and a worked example of a
+fourth problem that is harder to see: a healthcheck that reports success for the wrong
+reason.
 
 ---
 
@@ -50,12 +52,12 @@ This repository is a small stack that solves all three.
                     └──────────────────┘
 ```
 
-The application exposes one endpoint. It queries the database and returns the result,
-which is enough to prove the connection works end to end:
+One endpoint, which queries the database and returns the result — enough to prove the
+connection works end to end:
 
 ```bash
 curl http://localhost:3000
-{"status":"ok","db_time":"2026-08-31T00:13:40.437Z"}
+{"status":"ok","db_time":"2026-09-12T20:26:09.318Z"}
 ```
 
 That timestamp comes from Postgres, not from Node.
@@ -67,7 +69,7 @@ That timestamp comes from Postgres, not from Node.
 ```
 docker-compose.yml     # both services, network, volume
 .env                   # local config — not committed
-.env.example           # the keys, without the values
+.env.example           # the keys, ready to copy
 app/
   Dockerfile           # builds the application image
   index.js             # Express server, reads config from environment
@@ -86,7 +88,16 @@ Compose puts both containers on a shared network where each service is resolvabl
 its service name. No IP addresses appear anywhere in the configuration, so nothing
 breaks when containers are recreated and get different addresses.
 
-### 2. The application waits for the database to be *ready*, not just *started*
+### 2. The healthcheck runs a real query
+
+```yaml
+healthcheck:
+  test: ["CMD-SHELL", "psql -U ${DB_USER} -d ${DB_NAME} -c 'select 1' || exit 1"]
+  interval: 5s
+  retries: 5
+```
+
+Paired with:
 
 ```yaml
 depends_on:
@@ -95,19 +106,14 @@ depends_on:
 ```
 
 Plain `depends_on` waits for the database container to start. It does not wait for
-Postgres inside it to accept connections — and the gap between those two moments is
+Postgres inside it to accept connections, and the gap between those two moments is
 where the application crashes.
 
-Pairing `depends_on` with a healthcheck closes that gap:
+The check above authenticates as the application's user, connects to the application's
+database, and executes a query. Every one of those steps can fail independently, and
+each produces a red.
 
-```yaml
-healthcheck:
-  test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
-  interval: 5s
-  retries: 5
-```
-
-Compose now polls until Postgres genuinely answers before starting the application.
+**This replaced `pg_isready`, which could not.** See the troubleshooting log below.
 
 ### 3. Database storage lives in a named volume
 
@@ -137,8 +143,8 @@ const pool = new Pool({
 ```
 
 Nothing about where the database lives is written into the application. The same image
-runs against the Postgres container here, or against a managed database such as RDS,
-by changing values rather than code.
+runs against the Postgres container here, or against a managed database such as RDS, by
+changing values rather than code.
 
 This matters more than it first appears. The moment a hostname or credential is
 hardcoded, running in a second environment requires editing the source — and that is
@@ -170,7 +176,7 @@ mistake. It works, and it makes every single rebuild slow.
 git clone https://github.com/0dow0ri7s3/node-postgres-docker-compose.git
 cd node-postgres-docker-compose
 
-cp .env.example .env      # then set your own values
+cp .env.example .env      # then set a password
 docker compose up --build
 ```
 
@@ -186,7 +192,9 @@ docker compose down -v    # removes the volume too
 
 ---
 
-## Troubleshooting log — FATAL errors from a healthy application
+## Troubleshooting log — a healthcheck that was green and wrong
+
+### The symptom
 
 On the first run, the database logs filled with an error repeating every five seconds:
 
@@ -197,42 +205,128 @@ FATAL:  database "appuser" does not exist
 `appuser` is the database *user*. The database is `appdb`. Something was connecting
 with the username in the database field.
 
-**Ruling out the application.** Two details pointed away from it. The errors began at
-00:09:00, five seconds *before* the application reported `listening on 3000` — so they
-predated the app being able to send anything. And they repeated on a precise five-second
-cycle, which is not how an application behaves when nothing is calling it.
+Meanwhile the application was working. `curl` returned a valid timestamp read straight
+from Postgres — not "appeared to work", actually working, against the database
+something claimed did not exist.
 
-**Finding the five-second cycle.** The only thing in the stack running on a five-second
-interval was the healthcheck:
+### Ruling out the application
 
-```yaml
-healthcheck:
-  test: ["CMD-SHELL", "pg_isready -U ${DB_USER}"]
-  interval: 5s
-```
+Two details pointed away from it.
 
-**Root cause.** `pg_isready -U appuser` specifies a user but no database. Postgres
-defaults the database name to the username when it is not given, so it was looking for
-a database called `appuser`, which does not exist.
+**The errors started before the app did.** First error at 00:09:00; the app reported
+`listening on 3000` at 00:09:05. They predated it being able to send anything.
 
-**Fix.** Pass the database explicitly:
+**They repeated on an exact five-second cycle.** Applications do not behave that way
+when nothing is calling them. Scheduled things do.
+
+### Finding the five-second cycle
+
+The only thing in the stack running on a five-second interval was the healthcheck:
 
 ```yaml
-test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+test: ["CMD-SHELL", "pg_isready -U ${DB_USER}"]
+interval: 5s
 ```
+
+`pg_isready -U appuser` specifies a user but no database. Postgres defaults the database
+name to the username when it is not given, so it was asking for a database called
+`appuser`, which does not exist.
+
+### The part that mattered more than the fix
+
+Adding `-d ${DB_NAME}` stopped the errors. It did not fix the check.
+
+**The healthcheck had reported `healthy` throughout.** Every failed check came back
+green, because `pg_isready` treats any response from the server — including an error —
+as the server being up.
+
+It was not passing because things were fine. It was passing for the wrong reason, and
+the two are indistinguishable from outside.
+
+`pg_isready` does not authenticate and does not run a query. The only red it can
+produce is roughly "the server is not accepting connections". Credentials, permissions,
+whether the schema exists — all of it sits outside what the check can see.
+
+*(This distinction was sharpened by [Nguyen Thanh Vinh](https://www.linkedin.com/in/vinhnguyen203/),
+who pointed out that `-d` fixes the noise rather than the check.)*
+
+### The fix, and how it was tested
+
+The check was replaced with one that connects and runs a query:
+
+```yaml
+test: ["CMD-SHELL", "psql -U ${DB_USER} -d ${DB_NAME} -c 'select 1' || exit 1"]
+```
+
+A fix for a check that cannot fail is worth nothing unless you can make it fail. So the
+new one was tested by injecting a fault.
+
+**First attempt — changing `DB_NAME` to a nonexistent value — did not work as a test.**
+`DB_NAME` sets `POSTGRES_DB` on the database service *and* is read by the healthcheck.
+Changing it moved both sides together: Postgres created a database with the new name and
+the check asked for the new name. Consistent, and correctly green.
+
+So only one side was broken. The check was hardcoded to a database that does not exist:
+
+```yaml
+test: ["CMD-SHELL", "psql -U ${DB_USER} -d nosuchdb -c 'select 1' || exit 1"]
+```
+
+**Result:**
+
+```
+db-1  | FATAL:  database "nosuchdb" does not exist
+db-1  | FATAL:  database "nosuchdb" does not exist
+Container node-postgres-docker-compose-db-1  Error
+dependency db failed to start
+```
+
+The application never started.
+
+Compare that to the original failure: identical FATAL lines in the log, container marked
+`healthy`, application started anyway.
+
+**Same symptom. Opposite outcome.** The old check could not distinguish a working
+database from a missing one. The new one holds the application at the door until a real
+query succeeds.
 
 ### What this one teaches
 
-The application was working correctly the entire time. `curl` returned a valid timestamp
-from Postgres while the logs were still filling with `FATAL`.
+A log full of alarming errors is not automatically the problem you are looking for — the
+application was fine the entire time.
 
-The healthcheck also reported *healthy* throughout, because `pg_isready` treats a server
-that responds — even with an error — as a server that is up. So the check was passing for
-the wrong reason.
+The timing of an error is evidence. A message on a fixed interval comes from something
+scheduled, not something reacting. That single observation cut the search in half.
 
-Two lessons worth keeping. A log full of alarming errors is not automatically the problem
-you are looking for. And the timing of an error is evidence: a message on a fixed
-interval is coming from something scheduled, not from something reacting.
+And a check that cannot go red is not a check. If it gates anything — and with
+`condition: service_healthy` it gates the whole application — then a green for the wrong
+reason is not log noise. It is a release on a signal that was never measuring the thing
+it was gating.
+
+---
+
+## A smaller thing worth noting
+
+Compose and Postgres disagree about what to do with missing configuration.
+
+Running without a `.env` file, Compose warned and continued:
+
+```
+level=warning msg="The \"DB_PASSWORD\" variable is not set. Defaulting to a blank string."
+```
+
+Postgres refused:
+
+```
+Error: Database is uninitialized and superuser password is not specified.
+```
+
+Same missing input. One fails open, one fails closed. Postgres is right — a database
+created with a blank superuser password is worse than a database that did not start.
+
+`.env.example` in this repository is ready to copy directly, with only the password left
+blank. An example file whose lines are all commented out reproduces the Compose failure
+above for anyone cloning it.
 
 ---
 
@@ -244,8 +338,8 @@ A real stack needs migrations that run in a defined, repeatable order.
 **Run the application as a non-root user.** The container currently runs as root.
 Production images should add a dedicated user and drop to it.
 
-**Add a health endpoint for the application itself.** The database has a healthcheck; the
-app does not. A `/health` route would let Compose or an orchestrator detect a hung
+**Add a health endpoint for the application itself.** The database has a healthcheck;
+the app does not. A `/health` route would let Compose or an orchestrator detect a hung
 process rather than only a stopped one.
 
 **Pin the base image by digest.** `node:20-alpine` will change over time. Pinning the
